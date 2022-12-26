@@ -14,7 +14,7 @@ ENV YOUR_ENV=${YOUR_ENV} \
 RUN pip install "poetry==$POETRY_VERSION"
 
 WORKDIR /code
-COPY poetry.lock pyproject.toml /code/
+COPY pyproject.toml /code/
 
 RUN poetry config virtualenvs.create false \
     && poetry install --no-interaction --no-ansi

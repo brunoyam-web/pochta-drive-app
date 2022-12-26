@@ -10,6 +10,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import requests
 
+from models.file import File
+
 URL = str
 """ Str URL type """
 
@@ -19,22 +21,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/userinfo.email",
 ]
-
-# Another way to get access token
-# def __get_access_token(refresh_token: str):
-#     r = requests.post(
-#         "https://accounts.google.com/o/oauth2/token",
-#         headers={"content-type": "application/x-www-form-urlencoded"},
-#         data={
-#             "grant_type": "refresh_token",
-#             "refresh_token": refresh_token,
-#             "access_type": "offline",
-#             "client_id": os.getenv("CLIENT_ID"),
-#             "redirect_uri": os.getenv("REDIRECT_URI"),
-#             "client_secret": os.getenv("CLIENT_SECRET"),
-#         },
-#     )
-#     return r.json()["access_token"]
 
 
 def __authorize(refresh_token: str) -> Credentials:
@@ -47,20 +33,22 @@ def __authorize(refresh_token: str) -> Credentials:
         },
         scopes=SCOPES,
     )
-
-    if creds.expired:
-        creds.refresh(Request())
     pprint(vars(creds))
     print("creds.expired", creds.expired)
     print("creds.valid", creds.valid)
     return creds
 
 
-def __get_file_list(refresh_token: str):
+async def __get_file_list(refresh_token: str, email: str = ""):
+    try:
+        creds = __authorize(refresh_token)
+        print(f"{creds.token = }")
+    except Exception as e:
+        if creds.expired or not creds.valid:
+            creds.refresh(Request())
+            if email != "":
+                await db_service.write_creds_by_user_email(creds._refresh_token, email)
 
-    creds = __authorize(refresh_token)
-    print(f"{creds.token = }")
-    # return {}
     service = build("drive", "v3", credentials=creds)
 
     try:
@@ -82,6 +70,23 @@ def __get_file_list(refresh_token: str):
     except HttpError as error:
         # TODO(developer) - Handle errors from drive API.
         print(f"An error occurred: {error}")
+
+
+async def get_files_from_service_accounts():
+    service_accounts = await db_service.get_service_accounts()
+    files = []
+    for account in service_accounts:
+        f = await __get_file_list(account["refresh_token"])
+        print(f"{account['email'] = }: {len(files)}")
+        files += f
+    return files
+
+
+async def get_user_files(email: str):
+    refresh_token = await db_service.get_rt_by_user_email(email)
+    files = await __get_file_list(refresh_token, email)
+    files = [File(file) for file in files]
+    return files
 
 
 def generate_auth_link(
@@ -123,38 +128,131 @@ def exchange(code: str) -> tuple[Credentials, dict]:
             "client_secret": os.getenv("CLIENT_SECRET"),
         },
     )
-    creds = __authorize(refresh_token=r.json()["refresh_token"])
+    try:
+        print(r.json().keys())
+        # if "refresh_token" in r.json():
+        creds = __authorize(refresh_token=r.json()["refresh_token"])
+    except Exception as e:
+        print(
+            "Could not find refresh token. May be user has logined not for the first time"
+        )
 
-    service = build("oauth2", "v2", credentials=creds)
-    results = service.userinfo().get().execute()
-    user_info = {
-        "displayName": results["name"],
-        "email": results["email"],
-        "picture": results["picture"],
-    }
-
-    return creds, user_info
-
-
-def get_user_files(email: str):
-    refresh_token = db_service.get_rt_by_user_email(email)
-    files = __get_file_list(refresh_token)
-    return files
+    try:
+        service = build("oauth2", "v2", credentials=creds)
+        results = service.userinfo().get().execute()
+        user_info = {
+            "displayName": results["name"],
+            "email": results["email"],
+            "picture": results["picture"],
+        }
+        return creds, user_info
+    except Exception as e:
+        print(e)
+        return {}, {}
 
 
-def get_all_files():
-    service_accounts = db_service.get_service_accounts()
-    files = []
+async def copy_file_to_system(owner_email: str, file_id: str):
+    user_refresh_token = await db_service.get_rt_by_user_email(owner_email)
+
+    creds = __authorize(user_refresh_token)
+    service = build("drive", "v3", credentials=creds)
+
+    try:
+        permissions = (
+            service.permissions()
+            .create(fileId=file_id, body={"type": "anyone", "role": "reader"})
+            .execute()
+        )
+    except Exception as e:
+        print(e)
+
+    service_accounts = await db_service.get_service_accounts()
+
+    creds = __authorize(service_accounts[0]["refresh_token"])
+    service = build("drive", "v3", credentials=creds)
+    results = service.files().copy(fileId=file_id).execute()
+    new_file_id = results["id"]
+
+    # allow to share this file for others
+    permissions = (
+        service.permissions()
+        .create(fileId=new_file_id, body={"type": "anyone", "role": "reader"})
+        .execute()
+    )
+    return results, permissions
+
+
+async def make_system_file_public_if_not(file_id: str) -> bool:
+    service_accounts = await db_service.get_service_accounts()
+    service = None
+
     for account in service_accounts:
-        f = __get_file_list(account["refresh_token"])
-        print(f"{account['email'] = }: {len(files)}")
-        files += f
-    return files
+        creds = __authorize(account["refresh_token"])
+        service = build("drive", "v3", credentials=creds)
+        permissions = None
+        try:
+            permissions = service.permissions().list(fileId=file_id).execute()
+            print(f"{account['email']} IS owner")
+            # print(f"{file_id}: {permissions = }")
+        except Exception as e:
+            print(f"{account['email']} is not owner")
+        if permissions is not None:
+            owner = account
+            break
+    if (
+        permissions["permissions"][0]["role"] in ["reader", "writer"]
+        and permissions["permissions"][0]["type"] == "anyone"
+    ):
+        return
+    permissions = (
+        service.permissions()
+        .create(fileId=file_id, body={"type": "anyone", "role": "reader"})
+        .execute()
+    )
 
 
-def copy_file_to_system(fileId: str):
-    pass
+async def copy_file_to_user(email: str, file_id: str):
+    """Copies file by fileId to user google drive
 
+    Args:
+        email (str): user email to get token from db
+        fileId (str): google fileId
 
-if __name__ == "__main__":
-    get_all_files()
+    Returns:
+        results:
+
+        {
+            'kind': 'drive#file',
+            'id': '1GMbZUbqoNLvXOhrqsDB4UcPPR6UFOiNM',
+            'name': 'img.png',
+            'mimeType': 'image/jpeg'
+        }
+
+    """
+
+    refresh_token = await db_service.get_rt_by_user_email(email=email)
+    creds = __authorize(refresh_token)
+    service = build("drive", "v3", credentials=creds)
+    make_system_file_public_if_not(file_id)
+
+    results = service.files().copy(fileId=file_id).execute()
+    new_file_id = results["id"]
+
+    # allow to share this file for others
+    permissions = (
+        service.permissions()
+        .create(fileId=new_file_id, body={"type": "anyone", "role": "reader"})
+        .execute()
+    )
+
+    new_file = (
+        service.files()
+        .get(
+            fileId=new_file_id,
+            fields="id, name, mimeType, webContentLink, webViewLink",
+        )
+        .execute()
+    )
+    new_file = File(new_file)
+
+    return results, permissions
